@@ -1,4 +1,6 @@
-
+// Tambah ini di barisan atas sekali
+import { db } from "./firebaseConfig";
+import { collection, addDoc, serverTimestamp, getDocs, query, where, orderBy, limit } from "firebase/firestore";
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { UserProfile, UserRole, ERPHData, ERPHStatus, MasterData, Resource, WeeklyBundle, AppNotification, ScheduleSlot } from './types';
 import { DEFAULT_MASTER_DATA, WEEKS, sortSubjects } from './constants';
@@ -540,14 +542,28 @@ const App: React.FC = () => {
     }
   }, [notifications, readNotifIds]);
 
-  const handleSaveERPH = async (data: ERPHData) => {
+const handleSaveERPH = async (data: ERPHData) => {
+    // Kemaskini senarai lokal supaya nampak "instant" pada skrin
     const updated = [...allErphs];
     const idx = updated.findIndex(e => e.id === data.id);
     if (idx > -1) updated[idx] = data; else updated.push(data);
     setAllErphs(updated);
+    
     setSyncStatus('SYNCING');
+
     try {
-      // Strip reviewSignature from payload to prevent GAS from saving it as a separate file
+      // 1. SIMPAN KE FIREBASE (Langkah Tambahan - LAJU)
+      try {
+        await addDoc(collection(db, "erph_records"), {
+          ...data,
+          createdAt: serverTimestamp(),
+        });
+        console.log("Berjaya simpan ke Firebase");
+      } catch (fbErr) {
+        console.error("Firebase gagal, teruskan ke GAS:", fbErr);
+      }
+
+      // 2. SIMPAN KE GOOGLE SHEETS (Kod Asal - BACKUP)
       const { reviewSignature, ...payloadData } = data;
       await fetch(GAS_WEB_APP_URL, {
         method: 'POST', 
@@ -555,9 +571,15 @@ const App: React.FC = () => {
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: JSON.stringify({ ...payloadData, logType: "RPH_RECORD" })
       });
+      
       setSyncStatus('IDLE');
+      showNotification("Rekod berjaya disimpan!", "success");
       setTimeout(handleSyncCloud, 1500);
-    } catch (err) { setSyncStatus('OFFLINE'); }
+
+    } catch (err) { 
+      console.error("Ralat simpan GAS:", err);
+      setSyncStatus('OFFLINE'); 
+    }
   };
 
   const handleDeleteERPH = async (id: string) => {
