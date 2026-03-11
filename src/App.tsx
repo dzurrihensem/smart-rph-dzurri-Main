@@ -1,6 +1,5 @@
-// Tambah ini di barisan atas sekali
 import { db } from "./firebaseConfig";
-import { collection, addDoc, serverTimestamp, getDocs, query, where, orderBy, limit } from "firebase/firestore";
+import { collection, addDoc, serverTimestamp, getDocs, query, where, orderBy, limit, doc, setDoc } from "firebase/firestore";
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { UserProfile, UserRole, ERPHData, ERPHStatus, MasterData, Resource, WeeklyBundle, AppNotification, ScheduleSlot } from './types';
 import { DEFAULT_MASTER_DATA, WEEKS, sortSubjects } from './constants';
@@ -295,20 +294,41 @@ const App: React.FC = () => {
   const handleSyncCloud = useCallback(async () => {
     setSyncStatus('SYNCING');
     try {
+      // --- START FIREBASE INJECTION (READ PANTAS) ---
+      if (user) {
+        try {
+          // Cari 30 rekod RPH terbaru milik cikgu dari Firebase
+          const q = query(
+            collection(db, "erph_records"), 
+            where("teacherId", "==", user.id),
+            orderBy("createdAt", "desc"),
+            limit(30)
+          );
+          const snapshot = await getDocs(q);
+          const fbData = snapshot.docs.map(doc => ({ ...doc.data() } as ERPHData));
+          
+          if (fbData.length > 0) {
+            // Tapis yang status DELETED (supaya selari dengan logik GAS cikgu)
+            const activeFbData = fbData.filter(e => (e as any).status !== 'DELETED');
+            setAllErphs(activeFbData);
+            console.log("🚀 Data Firebase berjaya dimuatkan!");
+          }
+        } catch (fbErr) {
+          console.warn("⚠️ Firebase Read Gagal, teruskan dengan GAS:", fbErr);
+        }
+      }
+      // --- END FIREBASE INJECTION ---
+
       const data = await fetchRobust(GAS_WEB_APP_URL);
       const secondaryData = await fetchRobust(SECONDARY_GAS_URL).catch(() => null);
 
       if (data && data.status === "success") {
         if (data.masterData) {
-          // Deduplicate resources to prevent key errors
           if (data.masterData.resources) {
             const uniqueMap = new Map();
             data.masterData.resources.forEach((r: any) => uniqueMap.set(r.id, r));
             data.masterData.resources = Array.from(uniqueMap.values());
           }
-
-          // Backwards compatibility: ensure masterData always has a notifications array
-          // to prevent crashes in child components that might still expect it.
           data.masterData.notifications = data.masterData.notifications || [];
           setMasterData({
             ...DEFAULT_MASTER_DATA,
@@ -321,22 +341,17 @@ const App: React.FC = () => {
           });
         }
         if (data.erphs) {
-          // Filter out any ERPHs that were marked as DELETED
-          const activeErphs = data.erphs.filter((e: ERPHData) => e.status !== 'DELETED' as any);
+          const activeErphs = data.erphs.filter((e: ERPHData) => (e as any).status !== 'DELETED');
           setAllErphs(activeErphs);
         }
         
-        // Ultra-aggressive registry detection: find the best matching array in the response
         let registry: any[] = [];
         let maxScore = -1;
-        
         const scanForRegistry = (obj: any, depth = 0) => {
           if (!obj || typeof obj !== 'object' || depth > 3) return;
-          
           for (const key in obj) {
             const val = obj[key];
             if (Array.isArray(val) && val.length > 0) {
-              // Score this array based on how much it looks like a teacher registry
               let score = 0;
               const sample = val[0];
               if (typeof sample === 'object' && sample !== null) {
@@ -344,47 +359,28 @@ const App: React.FC = () => {
                 if (keys.some(k => k.includes('nama') || k.includes('name'))) score += 10;
                 if (keys.some(k => k.includes('login') || k.includes('id') || k.includes('ic'))) score += 5;
                 if (keys.some(k => k.includes('bidang') || k.includes('dept') || k.includes('unit'))) score += 3;
-                
-                // Bonus for specific keys mentioned by user
                 if (key.toLowerCase().includes('registry')) score += 20;
                 if (key.toLowerCase().includes('teacher')) score += 15;
                 if (key.toLowerCase().includes('guru')) score += 15;
-                
-                if (score > maxScore) {
-                  maxScore = score;
-                  registry = val;
-                }
+                if (score > maxScore) { maxScore = score; registry = val; }
               }
             } else if (typeof val === 'object' && val !== null) {
               scanForRegistry(val, depth + 1);
             }
           }
         };
-        
         scanForRegistry(data);
 
         if (registry && registry.length > 0) {
           setAllRegisteredTeachers(registry);
           localStorage.setItem('ssemj_registered_teachers', JSON.stringify(registry));
-          
-          // If a teacher is logged in, update their profile with fresh data from the registry
           if (user && user.role === UserRole.GURU) {
             const freshData = registry.find((t: any) => {
               const tid = String(t.id || t.login || t.loginid || t.login_id || t["LOGIN ID"] || t["Login ID"] || t["ID"] || t["LOGIN"] || t["No IC"] || t["NO IC"] || t.ic || "").trim().toLowerCase();
               return tid === String(user.id || "").trim().toLowerCase();
             });
-            
             if (freshData) {
-              const department = String(
-                freshData.bidang || 
-                freshData.department || 
-                freshData.unit || 
-                freshData["BIDANG"] || 
-                freshData["UNIT"] || 
-                user.department ||
-                ""
-              ).trim();
-
+              const department = String(freshData.bidang || freshData.department || freshData.unit || freshData["BIDANG"] || freshData["UNIT"] || user.department || "").trim();
               const updatedUser: UserProfile = {
                 ...user,
                 name: String(freshData.namaguru || freshData.nama_guru || freshData.name || freshData["NAMA GURU"] || freshData["Nama Guru"] || freshData["NAMA"] || freshData["Nama"] || freshData["NAMA PENUH"] || freshData["Nama Penuh"] || user.name).trim(),
@@ -392,21 +388,8 @@ const App: React.FC = () => {
                 phone: freshData.phone || freshData.no_tel || user.phone || "",
                 department: department,
                 grade: freshData.grade || freshData.gred || user.grade || "",
-                photoUrl: getDirectImageUrl(
-                  freshData.gambar || 
-                  freshData.photo || 
-                  freshData["GAMBAR"] || 
-                  freshData["Gambar"] || 
-                  freshData["PHOTO"] || 
-                  freshData["Photo"] || 
-                  freshData["URL FOTO"] || 
-                  freshData["Url Foto"] || 
-                  user.photoUrl ||
-                  ""
-                )
+                photoUrl: getDirectImageUrl(freshData.gambar || freshData.photo || freshData["GAMBAR"] || freshData["Gambar"] || freshData["PHOTO"] || freshData["Photo"] || freshData["URL FOTO"] || freshData["Url Foto"] || user.photoUrl || "")
               };
-              
-              // Only update if there's an actual change to avoid unnecessary re-renders
               if (JSON.stringify(updatedUser) !== JSON.stringify(user)) {
                 setUser(updatedUser);
                 localStorage.setItem('ssemj_user', JSON.stringify(updatedUser));
@@ -414,7 +397,6 @@ const App: React.FC = () => {
             }
           }
         }
-        
         if (data.schedules) {
           // If the cloud has schedules, merge or overwrite local ones
           // For "Individu", we might want to keep other teachers' schedules if they were already there
@@ -541,29 +523,175 @@ const App: React.FC = () => {
       }));
     }
   }, [notifications, readNotifIds]);
+  
+const handleDeleteERPH = async (id: string) => {
+    const erphToDelete = allErphs.find(e => e.id === id);
+    if (!erphToDelete) return;
 
-const handleSaveERPH = async (data: ERPHData) => {
-    // Kemaskini senarai lokal supaya nampak "instant" pada skrin
+    const updated = allErphs.filter(e => e.id !== id);
+    setAllErphs(updated);
+    setSyncStatus('SYNCING');
+
+    try {
+      // --- 1. KEMASKINI DI FIREBASE ---
+      try {
+        await addDoc(collection(db, "erph_records"), { 
+          ...erphToDelete, 
+          status: 'DELETED', 
+          deletedAt: serverTimestamp() 
+        });
+        console.log("Rekod dipadam di Firebase");
+      } catch (fbErr) {
+        console.error("Firebase delete gagal:", fbErr);
+      }
+
+      // --- 2. KEMASKINI DI GOOGLE SHEETS (GAS) ---
+      await fetch(GAS_WEB_APP_URL, {
+        method: 'POST', 
+        mode: 'no-cors', 
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ ...erphToDelete, status: 'DELETED', logType: "RPH_RECORD" })
+      });
+
+      setSyncStatus('IDLE');
+      showNotification("Rekod telah dipadam", "info");
+      setTimeout(handleSyncCloud, 1500);
+
+    } catch (err) { 
+      setSyncStatus('OFFLINE'); 
+    }
+  };
+
+  const handleSaveGroqApiKey = (apiKey: string) => {
+    setGroqApiKey(apiKey);
+    localStorage.setItem('groq_api_key', apiKey);
+  };
+
+  const handleBulkSubmitWeek = async (week: number, existingPdfBase64?: string) => {
+    if (!user) return;
+    const weekRPHs = allErphs.filter(e => e.teacherId === user.id && e.week === week);
+    if (weekRPHs.length === 0) return;
+
+    setIsProcessingBundle(true);
+    try {
+      const id_minggu = `M${week}_${user.id}_${Date.now()}`;
+      const payload = {
+        logType: "WEEKLY_SUBMISSION",
+        teacherName: user.name,
+        teacherId: user.id,
+        week: `Minggu ${week}`,
+        id_minggu: id_minggu,
+        rphIds: JSON.stringify(weekRPHs.map(r => r.id)),
+        pdfBase64: existingPdfBase64
+      };
+
+      // --- 1. SIMPAN REKOD HANTARAN KE FIREBASE (LAJU) ---
+      try {
+        await addDoc(collection(db, "weekly_submissions"), {
+          ...payload,
+          createdAt: serverTimestamp(),
+          status: 'PENDING_REVIEW'
+        });
+        console.log("Rekod hantaran mingguan berjaya masuk Firebase");
+      } catch (fbErr) {
+        console.error("Firebase submission gagal:", fbErr);
+      }
+
+      // --- 2. HANTAR KE GOOGLE SHEETS (GAS) SEPERTI ASAL ---
+      await fetch(GAS_WEB_APP_URL, {
+        method: 'POST', 
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(payload)
+      });
+
+      // Update status lokal
+      setAllErphs(prev => prev.map(e => weekRPHs.some(wr => wr.id === e.id) ? { ...e, status: ERPHStatus.SELESAI } : e));
+      
+      showNotification(`✅ Minggu ${week} telah berjaya dihantar!`, 'success');
+      setView('DASHBOARD');
+      setPreviewErphs([]);
+      
+      // Sync balik untuk kemaskini senarai hantaran
+      setTimeout(handleSyncCloud, 3000); 
+
+    } catch (e: any) { 
+      console.error("Submission Error:", e);
+      showNotification("Gagal hantar. Sila cuba lagi.", "error");
+    } finally { 
+      setIsProcessingBundle(false); 
+    }
+  };
+
+const handleReviewBundle = (bundleId: string, status: string, comment: string, signature: string, reviewedBy: string, reviewedPdfBase64?: string) => {
+    const bundle = bundles.find(b => b.id_minggu === bundleId);
+    
+    // Optimistic update for UI
+    if (status === "DISEMAK") {
+      setLocallyReviewedIds(prev => new Set(prev).add(bundleId));
+
+      // --- 1. SIMPAN KE FIREBASE (LAJU) ---
+      try {
+        addDoc(collection(db, "bundle_reviews"), {
+          bundleId,
+          status,
+          comment,
+          reviewedBy,
+          timestamp: serverTimestamp()
+        });
+        console.log("Semakan berjaya disimpan ke Firebase");
+      } catch (fbErr) {
+        console.error("Firebase review error:", fbErr);
+      }
+
+      if (bundle) {
+        let rphIds: string[] = [];
+        try {
+          rphIds = JSON.parse(bundle.rphIds || "[]");
+        } catch (e) {
+          if (typeof bundle.rphIds === 'string') {
+            rphIds = bundle.rphIds.split(',').map(id => id.trim());
+          }
+        }
+// Sambungan logik bundle processing anda yang tadi
+          const processedBundles = Array.from(bundleMap.values()).map((b: WeeklyBundle) => ({
+            ...b,
+            activePdfUrl: b.linkPdfSelesai && b.linkPdfSelesai.trim() !== "" 
+              ? b.linkPdfSelesai 
+              : (b.jana_url || b.pdfBase64)
+          }));
+          setBundles(processedBundles);
+        }
+        setSyncStatus('IDLE');
+      } else {
+        console.error("Sync returned non-success status:", data);
+        setSyncStatus('OFFLINE');
+      }
+    } catch (error: any) { 
+      console.error("Sync Error:", error);
+      setSyncStatus('OFFLINE'); 
+    }
+  }, [user, readNotifIds, locallyReviewedIds]);
+
+  // --- FUNGSI SIMPAN (YANG HILANG TADI) ---
+  const handleSaveERPH = async (data: ERPHData) => {
     const updated = [...allErphs];
     const idx = updated.findIndex(e => e.id === data.id);
     if (idx > -1) updated[idx] = data; else updated.push(data);
     setAllErphs(updated);
-    
     setSyncStatus('SYNCING');
 
     try {
-      // 1. SIMPAN KE FIREBASE (Langkah Tambahan - LAJU)
+      // 1. Simpan ke Firebase (Laju)
       try {
         await addDoc(collection(db, "erph_records"), {
           ...data,
           createdAt: serverTimestamp(),
+          source: "Firebase_Web"
         });
-        console.log("Berjaya simpan ke Firebase");
-      } catch (fbErr) {
-        console.error("Firebase gagal, teruskan ke GAS:", fbErr);
-      }
+      } catch (fbErr) { console.error("FB Save Gagal:", fbErr); }
 
-      // 2. SIMPAN KE GOOGLE SHEETS (Kod Asal - BACKUP)
+      // 2. Simpan ke Google Sheets (GAS)
       const { reviewSignature, ...payloadData } = data;
       await fetch(GAS_WEB_APP_URL, {
         method: 'POST', 
@@ -571,15 +699,10 @@ const handleSaveERPH = async (data: ERPHData) => {
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: JSON.stringify({ ...payloadData, logType: "RPH_RECORD" })
       });
-      
-      setSyncStatus('IDLE');
-      showNotification("Rekod berjaya disimpan!", "success");
-      setTimeout(handleSyncCloud, 1500);
 
-    } catch (err) { 
-      console.error("Ralat simpan GAS:", err);
-      setSyncStatus('OFFLINE'); 
-    }
+      setSyncStatus('IDLE');
+      setTimeout(handleSyncCloud, 1500);
+    } catch (err) { setSyncStatus('OFFLINE'); }
   };
 
   const handleDeleteERPH = async (id: string) => {
@@ -589,12 +712,18 @@ const handleSaveERPH = async (data: ERPHData) => {
     const updated = allErphs.filter(e => e.id !== id);
     setAllErphs(updated);
     setSyncStatus('SYNCING');
+
     try {
-      // Since we don't know if the backend supports DELETE_RPH action,
-      // we overwrite the record with a DELETED status so it gets filtered out.
+      try {
+        await addDoc(collection(db, "erph_records"), { 
+          ...erphToDelete, 
+          status: 'DELETED', 
+          deletedAt: serverTimestamp() 
+        });
+      } catch (fbErr) { console.error("FB Delete Gagal:", fbErr); }
+
       await fetch(GAS_WEB_APP_URL, {
-        method: 'POST', 
-        mode: 'no-cors', 
+        method: 'POST', mode: 'no-cors', 
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: JSON.stringify({ ...erphToDelete, status: 'DELETED', logType: "RPH_RECORD" })
       });
@@ -625,31 +754,41 @@ const handleSaveERPH = async (data: ERPHData) => {
         rphIds: JSON.stringify(weekRPHs.map(r => r.id)),
         pdfBase64: existingPdfBase64
       };
+
+      try {
+        await addDoc(collection(db, "weekly_submissions"), {
+          ...payload,
+          createdAt: serverTimestamp(),
+          status: 'PENDING_REVIEW'
+        });
+      } catch (fbErr) { console.error("FB Bulk Submit Gagal:", fbErr); }
+
       await fetch(GAS_WEB_APP_URL, {
-        method: 'POST', 
-        mode: 'no-cors',
+        method: 'POST', mode: 'no-cors',
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: JSON.stringify(payload)
       });
+
       setAllErphs(prev => prev.map(e => weekRPHs.some(wr => wr.id === e.id) ? { ...e, status: ERPHStatus.SELESAI } : e));
-      setTimeout(handleSyncCloud, 3000); 
       showNotification(`✅ Minggu ${week} telah berjaya dihantar!`, 'success');
       setView('DASHBOARD');
       setPreviewErphs([]);
+      setTimeout(handleSyncCloud, 3000); 
     } catch (e: any) { 
-      console.error("Submission Error:", e);
-    } finally { 
-      setIsProcessingBundle(false); 
-    }
+      showNotification("Gagal hantar. Sila cuba lagi.", "error");
+    } finally { setIsProcessingBundle(false); }
   };
 
   const handleReviewBundle = (bundleId: string, status: string, comment: string, signature: string, reviewedBy: string, reviewedPdfBase64?: string) => {
     const bundle = bundles.find(b => b.id_minggu === bundleId);
-    
-    // Optimistic update for UI
     if (status === "DISEMAK") {
-      // Add to local cache to prevent reappearing during slow sync
       setLocallyReviewedIds(prev => new Set(prev).add(bundleId));
+      try {
+        addDoc(collection(db, "bundle_reviews"), {
+          bundleId, status, comment, reviewedBy,
+          timestamp: serverTimestamp()
+        });
+      } catch (fbErr) { console.error("FB Review Gagal:", fbErr); }
 
       if (bundle) {
         let rphIds: string[] = [];
@@ -660,7 +799,6 @@ const handleSaveERPH = async (data: ERPHData) => {
             rphIds = bundle.rphIds.split(',').map(id => id.trim());
           }
         }
-
         if (rphIds.length === 0) {
           const weekMatch = String(bundle.week).match(/\d+/);
           const weekNum = weekMatch ? parseInt(weekMatch[0], 10) : null;
@@ -682,24 +820,19 @@ const handleSaveERPH = async (data: ERPHData) => {
             reviewedBy: reviewedBy 
           } : e));
         }
-        
-        // Also update bundles state locally so it disappears from "Pending" immediately
+   // Update senarai bundle supaya hilang dari "Pending"
         setBundles(prev => prev.map(b => b.id_minggu === bundleId ? { ...b, status_proses: "DISEMAK" } : b));
 
         if (bundle.teacherId) {
-          sendDirectNotification(`RPH anda untuk Minggu ${bundle.week} telah disemak dan disahkan oleh ${reviewedBy}.`, bundle.teacherId, 'SYSTEM');
+          sendDirectNotification(`RPH anda untuk Minggu ${bundle.week} telah disemak oleh ${reviewedBy}.`, bundle.teacherId, 'SYSTEM');
         }
       }
     }
 
-    // Add to background queue with metadata for secondary script
+    // --- 2. MASUKKAN DALAM QUEUE UNTUK GOOGLE SHEETS (GAS) ---
+    // Kita guna satu sahaja setReviewQueue supaya tidak bertindih (Dah dibetulkan)
     setReviewQueue(prev => [...prev, { 
-      bundleId, 
-      status, 
-      comment, 
-      signature, 
-      reviewedBy, 
-      reviewedPdfBase64,
+      bundleId, status, comment, signature, reviewedBy, reviewedPdfBase64,
       teacherName: bundle?.teacherName || "",
       week: bundle?.week || "",
       teacherId: bundle?.teacherId || ""
@@ -721,7 +854,6 @@ const handleSaveERPH = async (data: ERPHData) => {
         console.log(`[QUEUE] Memproses hantaran: ${task.bundleId} (Saiz PDF: ${pdfSizeKB}KB) (${reviewQueue.length} baki)`);
         setSyncStatus('SYNCING');
         
-        // Send to BOTH scripts to ensure redundancy and sheet updates
         const bundle = bundles.find(b => b.id_minggu === task.bundleId);
         const payload = { 
           logType: "BUNDLE_REVIEW", 
@@ -739,55 +871,45 @@ const handleSaveERPH = async (data: ERPHData) => {
           week: task.week,
           teacherId: task.teacherId,
           rphIds: bundle?.rphIds || "[]",
-          reviewedPdfBase64: task.reviewedPdfBase64, // Added for secondary script
-          URL_PDF: task.reviewedPdfBase64, // Added for secondary script
+          reviewedPdfBase64: task.reviewedPdfBase64,
+          URL_PDF: task.reviewedPdfBase64,
           sheetName: "Copy of Hantaran_Mingguan",
-          // Explicit column mapping for scripts that use header-based matching
           "rekod semakan": task.status,
           "Ulasan Penyemak": task.comment,
           "tandatangan penyemak": task.signature,
           "Disemak oleh": task.reviewedBy,
-          // Alternative keys used in some script versions
           "ulasan": task.comment,
           "reviewer": task.reviewedBy
         };
 
-        // 1. Send Metadata and Full PDF to BOTH scripts
-        console.log(`[QUEUE] Menghantar data semakan dan PDF ke kedua-dua GAS...`);
+        // 1. Send Metadata and Full PDF to BOTH scripts (Redundancy)
+        console.log(`[QUEUE] Menghantar data semakan ke kedua-dua GAS...`);
         const secondaryPromise = fetch(SECONDARY_GAS_URL, {
-          method: 'POST', 
-          mode: 'no-cors', 
+          method: 'POST', mode: 'no-cors', 
           headers: { 'Content-Type': 'text/plain;charset=utf-8' },
           body: JSON.stringify(payload)
         });
 
-        // Small delay to prevent simultaneous spreadsheet access
         await new Promise(resolve => setTimeout(resolve, 1000));
 
         const primaryPromise = fetch(GAS_WEB_APP_URL, {
-          method: 'POST', 
-          mode: 'no-cors', 
+          method: 'POST', mode: 'no-cors', 
           headers: { 'Content-Type': 'text/plain;charset=utf-8' },
           body: JSON.stringify(payload)
         });
 
         await Promise.all([secondaryPromise, primaryPromise]);
-
-        console.log(`[QUEUE] Berjaya dihantar ke kedua-dua GAS: ${task.bundleId}`);
+        console.log(`[QUEUE] Berjaya dihantar: ${task.bundleId}`);
         
-        // Remove completed task
         setReviewQueue(prev => prev.slice(1));
         
-        // Sync cloud after whole queue is processed with a safe delay
         if (reviewQueue.length === 1) {
-          console.log(`[QUEUE] Semua tugasan selesai. Menunggu 8s sebelum sync...`);
           setTimeout(() => {
             setIsProcessingQueue(false);
             setSyncStatus('IDLE');
             handleSyncCloud();
           }, 8000);
         } else {
-          console.log(`[QUEUE] Menunggu 5s sebelum hantaran seterusnya untuk mengelakkan had GAS...`);
           setTimeout(() => {
             setIsProcessingQueue(false);
             setSyncStatus('IDLE');
@@ -800,109 +922,14 @@ const handleSaveERPH = async (data: ERPHData) => {
         setSyncStatus('IDLE');
       }
     };
-
     processQueue();
-  }, [reviewQueue, isProcessingQueue, handleSyncCloud, bundles]);
+  }, [reviewQueue, isProcessingQueue, bundles, handleSyncCloud]);
 
-  const handleSyncMaster = async (updated: MasterData) => {
-    setSyncStatus('SYNCING');
-    try {
-      await fetch(GAS_WEB_APP_URL, {
-        method: 'POST', 
-        mode: 'no-cors', 
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({ logType: "MASTER_DATA_UPDATE", masterData: updated })
-      });
-      setSyncStatus('IDLE');
-      setTimeout(handleSyncCloud, 1500);
-      return true;
-    } catch(e) { setSyncStatus('OFFLINE'); return false; }
-  };
-
-  const handleUpdateTeacherPhoto = async (teacherId: string, photoBase64: string) => {
-    // This function is now deprecated as users update their own photo URLs.
-    // We can keep it for now in case admin override is needed later.
-    console.log(`Admin photo update for ${teacherId} is deprecated.`);
-  };
-
-  const handleLogout = () => { 
-    setUser(null); 
-    setAdminUser(null);
-    localStorage.removeItem('ssemj_user'); 
-    setAllErphs([]);
-    setBundles([]);
-    setNotifications([]);
-    // Keep allRegisteredTeachers to avoid empty login screen
-    setView('REGISTER'); 
-  };
-
-  const handleUpdateProfile = async (data: Partial<UserProfile>) => {
-    if (!user) return;
-    
-    const updatedUser = { ...user, ...data };
-    setUser(updatedUser);
-    localStorage.setItem('ssemj_user', JSON.stringify(updatedUser));
-
-    // Also update the master list of teachers if the user is a teacher
-    setAllRegisteredTeachers(prev => {
-      const updated = prev.map(t => t.id === user.id ? updatedUser : t);
-      localStorage.setItem('ssemj_registered_teachers', JSON.stringify(updated));
-      return updated;
-    });
-
-    // Background sync
-    try {
-      await fetch(GAS_WEB_APP_URL, {
-        method: 'POST',
-        mode: 'no-cors',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({ 
-          logType: "UPDATE_PROFILE", // Match GAS Workflow 3
-          login: data.id || user.id, // Column A
-          name: data.name || user.name, // Column B
-          photoUrl: data.photoUrl !== undefined ? data.photoUrl : user.photoUrl, // Column C
-          department: data.department || user.department, // Column D
-          email: data.email || user.email, // Column E
-          phone: data.phone || user.phone, // Column F
-          grade: data.grade || user.grade // Column G
-        })
-      });
-    } catch (e) {
-      console.error("Profile Sync Error", e);
-    }
-  };
-
-  const handleShareERPH = async (erph: ERPHData, recipientId: string) => {
-    const recipient = allTeachers.find(t => t.id === recipientId);
-    if (!recipient) return;
-
-    const sharedData: ERPHData = {
-      ...erph,
-      id: Math.random().toString(36).substr(2, 9),
-      teacherId: recipient.id,
-      teacherName: recipient.name,
-      status: ERPHStatus.DRAFT,
-    };
-
-    setSyncStatus('SYNCING');
-    try {
-      await fetch(GAS_WEB_APP_URL, {
-        method: 'POST', 
-        mode: 'no-cors', 
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-        body: JSON.stringify({ ...sharedData, logType: "RPH_RECORD" })
-      });
-      setSyncStatus('IDLE');
-      setTimeout(handleSyncCloud, 1500);
-    } catch (err) { 
-      setSyncStatus('OFFLINE'); 
-    }
-  };
-
+  // --- 1. NOTIFIKASI TERUS (FIREBASE + GAS) ---
   const sendDirectNotification = async (message: string, recipientId: string, type: 'SYSTEM' | 'MESSAGE' = 'SYSTEM') => {
     if (!user) return;
     const newNotif: AppNotification = {
-      id: Math.random().toString(36).substr(2, 9),
+      id: `NOTIF_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
       senderId: user.id,
       senderName: user.name,
       message,
@@ -912,39 +939,38 @@ const handleSaveERPH = async (data: ERPHData) => {
       recipientId,
     };
 
-    // If sending to self, update local state immediately
-    if (recipientId === user.id) {
-      setNotifications(prev => {
-        const next = [newNotif, ...prev];
-        return next.sort((a, b) => {
-          const timeA = new Date(a.timestamp).getTime();
-          const timeB = new Date(b.timestamp).getTime();
-          if (isNaN(timeA) && isNaN(timeB)) return 0;
-          if (isNaN(timeA)) return 1;
-          if (isNaN(timeB)) return -1;
-          return timeB - timeA;
-        });
-      });
-    }
+    // Optimistic Update: Masuk dalam UI terus
+    setNotifications(prev => [newNotif, ...prev].sort((a, b) => 
+      new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+    ));
 
     try {
+      // --- SIMPAN KE FIREBASE (REAL-TIME) ---
+      try {
+        await addDoc(collection(db, "app_notifications"), {
+          ...newNotif,
+          createdAt: serverTimestamp()
+        });
+      } catch (fbErr) { console.error("FB Notif Error:", fbErr); }
+
+      // --- SIMPAN KE GAS ---
       await fetch(GAS_WEB_APP_URL, {
         method: 'POST', 
         mode: 'no-cors', 
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: JSON.stringify({ ...newNotif, logType: "NOTIFICATION" })
       });
-      // Optional: Sync again to confirm, but optimistic update is enough for UI
+      
       setTimeout(handleSyncCloud, 1500); 
     } catch (err) { 
-      console.error("Failed to send direct notification", err);
+      console.error("Failed to send notification", err);
     }
   };
 
   const handleSendNotification = async (message: string) => {
     if (!user) return;
     const newNotif: AppNotification = {
-      id: Math.random().toString(36).substr(2, 9),
+      id: `ANN_${Date.now()}`,
       senderId: user.id,
       senderName: user.name,
       message,
@@ -953,19 +979,20 @@ const handleSaveERPH = async (data: ERPHData) => {
       read: false,
     };
 
-    setNotifications(prev => {
-      const next = [newNotif, ...prev];
-      return next.sort((a, b) => {
-        const timeA = new Date(a.timestamp).getTime();
-        const timeB = new Date(b.timestamp).getTime();
-        if (isNaN(timeA) && isNaN(timeB)) return 0;
-        if (isNaN(timeA)) return 1;
-        if (isNaN(timeB)) return -1;
-        return timeB - timeA;
-      });
-    });
+    setNotifications(prev => [newNotif, ...prev].sort((a, b) => 
+      new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+    ));
+    
     setSyncStatus('SYNCING');
     try {
+      // Firebase Broadcast
+      try {
+        await addDoc(collection(db, "app_notifications"), {
+          ...newNotif,
+          createdAt: serverTimestamp()
+        });
+      } catch (e) { console.error("FB Announcement Error", e); }
+
       await fetch(GAS_WEB_APP_URL, {
         method: 'POST', 
         mode: 'no-cors', 
@@ -973,22 +1000,42 @@ const handleSaveERPH = async (data: ERPHData) => {
         body: JSON.stringify({ ...newNotif, logType: "NOTIFICATION" })
       });
       setSyncStatus('IDLE');
-      // Optional: Sync again to confirm, but optimistic update is enough for UI
       setTimeout(handleSyncCloud, 1500); 
-    } catch (err) { 
-      setSyncStatus('OFFLINE'); 
-      // Optional: Implement rollback on failure
-      // setNotifications(prev => prev.filter(n => n.id !== newNotif.id));
-    }
+    } catch (err) { setSyncStatus('OFFLINE'); }
   };
 
   const handleAddResource = async (resource: Omit<Resource, 'id' | 'uploadedAt'>) => {
     const newResource: Resource = {
       ...resource,
-      id: Math.random().toString(36).substr(2, 9),
+      id: `RES_${Date.now()}`,
       uploadedAt: new Date().toISOString(),
       uploaderId: user?.id
     };
+
+    setSyncStatus('SYNCING');
+    try {
+      // Simpan Resource ke Firebase
+      try {
+        await addDoc(collection(db, "resources"), {
+          ...newResource,
+          createdAt: serverTimestamp()
+        });
+      } catch (e) { console.error("FB Resource Error", e); }
+
+      await fetch(GAS_WEB_APP_URL, {
+        method: 'POST',
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ 
+          logType: "RESOURCE_SYNC", 
+          resource: JSON.stringify(newResource) 
+        })
+      });
+      setSyncStatus('IDLE');
+      showNotification("Bahan berjaya dimuat naik!", "success");
+      setTimeout(handleSyncCloud, 1500);
+    } catch (err) { setSyncStatus('OFFLINE'); }
+  };
 
     const updatedResources = [newResource, ...masterData.resources];
     setMasterData(prev => ({ ...prev, resources: updatedResources }));
@@ -1137,292 +1184,172 @@ const handleSaveERPH = async (data: ERPHData) => {
         />
       )}
 
-      {user && view === 'DASHBOARD' && (
-        <TeacherDashboard 
-          user={user} 
-          adminUser={adminUser}
-          erphs={allErphs.filter(e => 
-            (String(e.teacherId || "").trim().toLowerCase() === String(user.id || "").trim().toLowerCase()) ||
-            (String(e.teacherName || "").trim().toLowerCase() === String(user.name || "").trim().toLowerCase())
-          )} 
-          bundles={bundles.filter(b => 
-            (String(b.teacherId || "").trim().toLowerCase() === String(user.id || "").trim().toLowerCase()) ||
-            (String(b.teacherName || "").trim().toLowerCase() === String(user.name || "").trim().toLowerCase())
-          )}
-          teachers={allTeachers}
-          masterSchedule={masterSchedule}
-          masterData={masterData}
-          onAddNew={() => { setEditingErph(null); setView('FORM'); }}
-          onEdit={(erph) => { setEditingErph(erph); setView('FORM'); }}
-          onCopy={(erph) => { setEditingErph({ ...erph, id: Math.random().toString(36).substr(2, 9), status: ERPHStatus.DRAFT }); setView('FORM'); }}
-          onView={(erph) => { setPreviewErphs([erph]); setView('PREVIEW'); }}
-          onShare={handleShareERPH}
-          onDelete={handleDeleteERPH}
-          onViewWeek={(week) => {
-            const weekRPHs = allErphs.filter(e => 
-              ((String(e.teacherId || "").trim().toLowerCase() === String(user.id || "").trim().toLowerCase()) ||
-               (String(e.teacherName || "").trim().toLowerCase() === String(user.name || "").trim().toLowerCase())) && 
-              e.week === week
-            );
-            setPreviewErphs(weekRPHs);
-            setView('PREVIEW');
-          }}
-          onBulkSubmit={handleBulkSubmitWeek}
-          onSync={handleSyncCloud}
-          syncStatus={syncStatus}
-          onAddResource={handleAddResource}
-          onDeleteResource={handleDeleteResource}
-          onSelectScheduleSlot={(slot) => {
-            // 1. Find the latest unsubmitted week
-            const submittedWeekNums = bundles.map(b => {
-              const m = b.week.match(/\d+/);
-              return m ? parseInt(m[0]) : 0;
-            });
-            const latestUnsubmittedWeek = WEEKS.find(w => !submittedWeekNums.includes(w)) || 1;
-
-            // 2. Try to find a reference date for this week
-            let targetDate = new Date().toISOString().split('T')[0];
-            const daysMap: Record<string, number> = { 'ISNIN': 1, 'SELASA': 2, 'RABU': 3, 'KHAMIS': 4, 'JUMAAT': 5, 'SABTU': 6, 'AHAD': 0 };
-            const targetDayIdx = daysMap[slot.day?.toUpperCase() || 'ISNIN'];
-
-            // Find any RPH as a reference to calculate the date for the target week
-            const sortedRPHs = [...allErphs].sort((a, b) => b.week - a.week);
-            if (sortedRPHs.length > 0) {
-              const refRPH = sortedRPHs[0];
-              const refDate = new Date(refRPH.date + 'T12:00:00');
-              const refDayIdx = daysMap[refRPH.day?.toUpperCase() || 'ISNIN'];
-              
-              const weekDiff = latestUnsubmittedWeek - refRPH.week;
-              const dayDiff = targetDayIdx - refDayIdx;
-              refDate.setDate(refDate.getDate() + (weekDiff * 7) + dayDiff);
-              targetDate = refDate.toISOString().split('T')[0];
-            } else {
-              // If no RPHs at all, use today as a reference for the current week
-              // This is a fallback and might not be perfectly accurate without a school calendar start date
-              const today = new Date();
-              const todayDayIdx = today.getDay();
-              const dayDiff = targetDayIdx - todayDayIdx;
-              today.setDate(today.getDate() + dayDiff);
-              targetDate = today.toISOString().split('T')[0];
-            }
-
-            setEditingErph({
-              ...slot,
-              id: Math.random().toString(36).substr(2, 9),
-              week: latestUnsubmittedWeek,
-              date: targetDate,
-              status: ERPHStatus.DRAFT,
-              objective: '',
-              activities: '',
-              reflection: '',
-              language: 'BM',
-              bbm: 'Buku Teks'
-            } as ERPHData);
-            setView('FORM');
-          }}
-          onNavigate={(v) => setView(v as any)}
-          notifications={notifications}
-        />
-      )}
-
-      {user && view === 'FORM' && (
-        <ERPHForm 
-          user={user} 
-          masterData={masterData} 
-          erphs={allErphs}
-          masterSchedule={masterSchedule}
-          initialData={editingErph || undefined}
-          onSave={handleSaveERPH}
-          onCancel={() => setView('DASHBOARD')}
-          groqApiKey={groqApiKey}
-        />
-      )}
-
-      {user && view === 'ADMIN' && (
-        <AdminDashboard 
-          user={user}
-          teachers={allTeachers} // Pass the generated teachers list
-          erphs={allErphs}
-          bundles={bundles}
-          masterData={masterData}
-          setMasterData={setMasterData}
-          onReview={(id, status, comment, signature) => {
-            const erph = allErphs.find(e => e.id === id);
-            if (erph) handleSaveERPH({ ...erph, status, reviewComment: comment, reviewSignature: signature, reviewedAt: new Date().toISOString() });
-          }}
-          onReviewBundle={handleReviewBundle}
-          onSyncMaster={handleSyncMaster}
-          onRefresh={handleSyncCloud}
-          onLogout={handleLogout} // Pass the handleLogout function
-          onNavigate={(v) => setView(v as any)}
-          onAddResource={handleAddResource}
-          onDeleteResource={handleDeleteResource}
-          onLoginAsTeacher={(teacher) => {
-            // Save the current admin user
-            setAdminUser(user);
-            // Set the user to the selected teacher
-            setUser(teacher);
-            // Change view to teacher dashboard
-            setView('DASHBOARD');
-            // Show a notification
-            setNotification({
-              message: `Anda kini log masuk sebagai ${teacher.name}`,
-              type: 'info'
-            });
-            setTimeout(() => setNotification(null), 3000);
-          }}
-        />
-      )}
-
-      {user && view === 'PREVIEW' && (
-        <ERPHPreview 
-          erphs={previewErphs} 
-          onBack={() => setView('DASHBOARD')}
-          onSubmit={(week, pdfBase64) => handleBulkSubmitWeek(week, pdfBase64)}
-        />
-      )}
-
-      {user && view === 'SETTINGS' && (
-        <Settings 
-          groqApiKey={groqApiKey}
-          onSaveApiKey={handleSaveGroqApiKey}
-          onBack={() => setView(user.role === UserRole.ADMIN ? 'ADMIN' : 'DASHBOARD')}
-        />
-      )}
-
-      {user && view === 'ANALYSIS' && (
-        <Analysis 
-          teachers={allTeachers}
-          bundles={bundles}
-          onBack={() => setView(user.role === UserRole.ADMIN ? 'ADMIN' : 'DASHBOARD')}
-        />
-      )}
-
-      {user && view === 'CHAT' && (
-        <Notifications 
-          user={user}
-          notifications={notifications}
-          onSend={handleSendNotification}
-          onRead={handleMarkAsRead}
-          onBack={() => setView(user.role === UserRole.ADMIN ? 'ADMIN' : 'DASHBOARD')}
-        />
-      )}
-
-      {user && view === 'TIMETABLE' && (
-        <Timetable 
-          user={user}
-          schedule={masterSchedule}
-          erphs={allErphs}
-          masterData={masterData}
-          onAddSlot={(slot) => {
-            const next = [...masterSchedule, slot];
-            setMasterSchedule(next);
-            localStorage.setItem('ssemj_master_schedule', JSON.stringify(next));
-            handleSaveSchedule(next.filter(s => s.teacherId === user.id));
-          }}
-          onDeleteSlot={(id) => {
-            const next = masterSchedule.filter(s => s.id !== id);
-            setMasterSchedule(next);
-            localStorage.setItem('ssemj_master_schedule', JSON.stringify(next));
-            handleSaveSchedule(next.filter(s => s.teacherId === user.id));
-          }}
-          onSelectSlot={(slot) => {
-            setEditingErph({
-              ...slot,
-              id: Math.random().toString(36).substr(2, 9),
-              date: new Date().toISOString().split('T')[0],
-              status: ERPHStatus.DRAFT,
-              objective: '',
-              activities: '',
-              reflection: '',
-              language: 'BM',
-              bbm: 'Buku Teks'
-            } as ERPHData);
-            setView('FORM');
-          }}
-          onBack={() => setView(user.role === UserRole.ADMIN ? 'ADMIN' : 'DASHBOARD')}
-        />
-      )}
-
-      {user && view === 'PENCERAPAN' && (
-        <Pencerapan 
-          user={user}
-          teachers={allTeachers}
-          erphs={allErphs}
-          onBack={() => setView('ADMIN')}
-          onSubmitObservation={(erphId, status, comment, signature, reviewerName, reviewerDesignation, isObservation) => {
-            const erph = allErphs.find(e => e.id === erphId);
-            if (erph) {
-              const updatedErph = { ...erph, status };
-              
-              if (isObservation) {
-                updatedErph.isObservation = true;
-                updatedErph.observationComment = comment;
-                updatedErph.observationSignature = signature;
-                updatedErph.observedBy = reviewerName;
-                updatedErph.observerDesignation = reviewerDesignation;
-                updatedErph.observedAt = new Date().toISOString();
+     <React.Suspense fallback={<div className="flex items-center justify-center h-[80vh]"><Loader2 className="animate-spin w-12 h-12 text-blue-600" /></div>}>
+        {view === 'REGISTER' && (
+          <Register 
+            teachers={allTeachers}
+            isLoading={syncStatus === 'SYNCING'}
+            isOffline={syncStatus === 'OFFLINE'}
+            onSync={handleSyncCloud}
+            onSelectRole={(role, teacherProfile) => {
+              if (role === UserRole.GURU && teacherProfile) {
+                setUser(teacherProfile);
+                localStorage.setItem('ssemj_user', JSON.stringify(teacherProfile));
+                setView('DASHBOARD');
               } else {
-                updatedErph.reviewComment = comment;
-                updatedErph.reviewSignature = signature;
-                updatedErph.reviewedBy = reviewerName;
-                updatedErph.reviewerDesignation = reviewerDesignation;
-                updatedErph.reviewedAt = new Date().toISOString();
+                const newUser: UserProfile = {
+                  id: role === UserRole.ADMIN ? 'admin-1' : 'teacher-1',
+                  name: role === UserRole.ADMIN ? 'Pentadbir SSEMJ' : 'Guru SSEMJ',
+                  email: '',
+                  phone: '',
+                  role: role,
+                  designation: role === UserRole.ADMIN ? 'Pentadbir' : 'Guru Akademik',
+                  department: role === UserRole.ADMIN ? 'Pentadbiran' : 'Bidang Kesenian',
+                  grade: 'DG41',
+                  photoUrl: "",
+                };
+                setUser(newUser);
+                localStorage.setItem('ssemj_user', JSON.stringify(newUser));
+                setView(role === UserRole.ADMIN ? 'ADMIN' : 'DASHBOARD');
               }
+            }} 
+          />
+        )}
 
-              handleSaveERPH(updatedErph);
+        {user && view === 'DASHBOARD' && (
+          <TeacherDashboard 
+            user={user} 
+            adminUser={adminUser}
+            erphs={allErphs.filter(e => 
+              (String(e.teacherId || "").trim().toLowerCase() === String(user.id || "").trim().toLowerCase())
+            )} 
+            bundles={bundles.filter(b => 
+              (String(b.teacherId || "").trim().toLowerCase() === String(user.id || "").trim().toLowerCase())
+            )}
+            teachers={allTeachers}
+            masterSchedule={masterSchedule}
+            masterData={masterData}
+            onAddNew={() => { setEditingErph(null); setView('FORM'); }}
+            onEdit={(erph) => { setEditingErph(erph); setView('FORM'); }}
+            onCopy={(erph) => { setEditingErph({ ...erph, id: `COPY_${Date.now()}`, status: ERPHStatus.DRAFT }); setView('FORM'); }}
+            onView={(erph) => { setPreviewErphs([erph]); setView('PREVIEW'); }}
+            onShare={handleShareERPH}
+            onDelete={handleDeleteERPH}
+            onViewWeek={(week) => {
+              const weekRPHs = allErphs.filter(e => e.teacherId === user.id && e.week === week);
+              setPreviewErphs(weekRPHs);
+              setView('PREVIEW');
+            }}
+            onBulkSubmit={handleBulkSubmitWeek}
+            onSync={handleSyncCloud}
+            syncStatus={syncStatus}
+            onAddResource={handleAddResource}
+            onDeleteResource={handleDeleteResource}
+            onSelectScheduleSlot={(slot) => {
+              const submittedWeekNums = bundles.map(b => {
+                const m = b.week.match(/\d+/);
+                return m ? parseInt(m[0]) : 0;
+              });
+              const latestUnsubmittedWeek = WEEKS.find(w => !submittedWeekNums.includes(w)) || 1;
+              setEditingErph({
+                ...slot,
+                id: `SLOT_${Date.now()}`,
+                week: latestUnsubmittedWeek,
+                date: new Date().toISOString().split('T')[0],
+                status: ERPHStatus.DRAFT,
+                objective: '', activities: '', reflection: '', language: 'BM', bbm: 'Buku Teks'
+              } as ERPHData);
+              setView('FORM');
+            }}
+            onNavigate={(v) => setView(v as any)}
+            notifications={notifications}
+          />
+        )}
 
-              if (erph.teacherId) {
-                const notifMsg = isObservation 
-                  ? `RPH anda pada ${erph.date} telah dicerap oleh ${reviewerName}.`
-                  : `RPH anda pada ${erph.date} telah disemak oleh ${reviewerName}.`;
-                sendDirectNotification(notifMsg, erph.teacherId, 'SYSTEM');
-              }
-            }
-          }}
-        />
-      )}
+        {user && view === 'FORM' && (
+          <ERPHForm 
+            user={user} 
+            masterData={masterData} 
+            erphs={allErphs}
+            masterSchedule={masterSchedule}
+            initialData={editingErph || undefined}
+            onSave={handleSaveERPH}
+            onCancel={() => setView('DASHBOARD')}
+            groqApiKey={groqApiKey}
+          />
+        )}
 
-      {user && view === 'REKOD_PENCERAPAN' && (
-        <RekodPencerapan 
-          user={user}
-          erphs={allErphs}
-          teachers={allTeachers}
-          onBack={() => setView(user.role === UserRole.ADMIN ? 'ADMIN' : 'DASHBOARD')}
-          onView={(erph) => { setPreviewErphs([erph]); setView('PREVIEW'); }}
-        />
-      )}
+        {user && view === 'ADMIN' && (
+          <AdminDashboard 
+            user={user}
+            teachers={allTeachers}
+            erphs={allErphs}
+            bundles={bundles}
+            masterData={masterData}
+            onReviewBundle={handleReviewBundle}
+            onSyncMaster={handleSyncMaster}
+            onRefresh={handleSyncCloud}
+            onLogout={handleLogout}
+            onNavigate={(v) => setView(v as any)}
+            onAddResource={handleAddResource}
+            onDeleteResource={handleDeleteResource}
+            onLoginAsTeacher={(teacher) => {
+              setAdminUser(user);
+              setUser(teacher);
+              setView('DASHBOARD');
+              showNotification(`Anda kini log masuk sebagai ${teacher.name}`, 'info');
+              handleSyncCloud(); 
+            }}
+          />
+        )}
 
-      {user && view === 'MASTER_DATA_MANAGER' && (
-        <MasterDataManager 
-          masterData={masterData}
-          onSave={async (newData) => {
-            const success = await handleSyncMaster(newData);
-            if (success) {
-              setMasterData(newData);
-              localStorage.setItem('ssemj_master_data', JSON.stringify(newData));
-              showNotification("Data Utama telah dikemaskini!", 'success');
-            } else {
-              showNotification("Gagal mengemaskini Data Utama ke awan.", 'error');
-            }
-          }}
-          onBack={() => setView('ADMIN')}
-        />
-      )}
+        {user && view === 'PREVIEW' && (
+          <ERPHPreview 
+            erphs={previewErphs} 
+            onBack={() => setView('DASHBOARD')}
+            onSubmit={(week, pdfBase64) => handleBulkSubmitWeek(week, pdfBase64)}
+          />
+        )}
+
+        {user && (view === 'SETTINGS' || view === 'ANALYSIS' || view === 'CHAT' || view === 'TIMETABLE' || view === 'PENCERAPAN' || view === 'REKOD_PENCERAPAN' || view === 'MASTER_DATA_MANAGER') && (
+          <div className="p-4">
+             {view === 'SETTINGS' && <Settings groqApiKey={groqApiKey} onSaveApiKey={handleSaveGroqApiKey} onBack={() => setView(user.role === UserRole.ADMIN ? 'ADMIN' : 'DASHBOARD')} />}
+             {view === 'ANALYSIS' && <Analysis teachers={allTeachers} bundles={bundles} onBack={() => setView(user.role === UserRole.ADMIN ? 'ADMIN' : 'DASHBOARD')} />}
+             {view === 'CHAT' && <Notifications user={user} notifications={notifications} onSend={handleSendNotification} onRead={handleMarkAsRead} onBack={() => setView(user.role === UserRole.ADMIN ? 'ADMIN' : 'DASHBOARD')} />}
+             {view === 'TIMETABLE' && (
+               <Timetable 
+                 user={user} schedule={masterSchedule} erphs={allErphs} masterData={masterData}
+                 onAddSlot={(slot) => { const next = [...masterSchedule, slot]; setMasterSchedule(next); handleSaveSchedule(next.filter(s => s.teacherId === user.id)); }}
+                 onDeleteSlot={(id) => { const next = masterSchedule.filter(s => s.id !== id); setMasterSchedule(next); handleSaveSchedule(next.filter(s => s.teacherId === user.id)); }}
+                 onBack={() => setView(user.role === UserRole.ADMIN ? 'ADMIN' : 'DASHBOARD')}
+               />
+             )}
+             {view === 'PENCERAPAN' && (
+               <Pencerapan 
+                 user={user} teachers={allTeachers} erphs={allErphs} onBack={() => setView('ADMIN')}
+                 onSubmitObservation={(erphId, status, comment, signature, reviewerName, reviewerDesignation, isObservation) => {
+                    const erph = allErphs.find(e => e.id === erphId);
+                    if (erph) {
+                      const updated = { ...erph, status, [isObservation ? 'observedBy' : 'reviewedBy']: reviewerName, [isObservation ? 'observationComment' : 'reviewComment']: comment };
+                      handleSaveERPH(updated);
+                      if (erph.teacherId) sendDirectNotification(`RPH anda telah ${isObservation ? 'dicerap' : 'disemak'} oleh ${reviewerName}.`, erph.teacherId);
+                    }
+                 }}
+               />
+             )}
+          </div>
+        )}
       </React.Suspense>
 
       <div ref={hiddenRenderRef} className="fixed left-[-9999px] top-[-9999px] opacity-0 pointer-events-none">
         {previewErphs.length > 0 && <ERPHPreview erphs={previewErphs} onBack={() => {}} />}
       </div>
 
-      {/* Notification Toast */}
       {notification && (
-        <div className={`fixed bottom-8 left-1/2 -translate-x-1/2 z-[300] px-6 py-4 rounded-2xl shadow-2xl flex items-center gap-3 animate-slideUp border ${
-          notification.type === 'success' ? 'bg-emerald-500 text-white border-emerald-400' : 
-          notification.type === 'error' ? 'bg-rose-500 text-white border-rose-400' : 
-          'bg-slate-900 text-white border-slate-800'
-        }`}>
-          <span className="text-xs font-black uppercase tracking-widest">{notification.message}</span>
+        <div className={`fixed bottom-8 left-1/2 -translate-x-1/2 z-[300] px-6 py-4 rounded-2xl shadow-2xl animate-slideUp border ${
+          notification.type === 'success' ? 'bg-emerald-500 border-emerald-400' : 'bg-slate-900 border-slate-800'
+        } text-white text-xs font-black uppercase tracking-widest`}>
+          {notification.message}
         </div>
       )}
     </Layout>
